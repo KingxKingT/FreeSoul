@@ -22,6 +22,9 @@ class DnsVpnService : VpnService() {
     private lateinit var customDomains: Set<String>
     private lateinit var blocklist: DomainBlocklist
 
+    // SafeSearch target -> (expiry time, IPv4 addresses). Only used by the single packet-loop thread.
+    private val rewriteCache = HashMap<String, Pair<Long, List<ByteArray>>>()
+
     override fun onCreate() {
         super.onCreate()
         blocklist = DomainBlocklist(applicationContext)
@@ -79,12 +82,17 @@ class DnsVpnService : VpnService() {
                 val query = DnsPacketCodec.parseIpv4UdpQuery(buffer, length) ?: continue
                 val host = DomainMatcher.normalize(query.hostname)
                 val blocked = host != null &&
-                    (blocklist.isBlocked(host) || DomainMatcher.isBlocked(host, customDomains))
-                val replyDns = if (blocked) {
-                    ProtectionState.onBlocked(query.hostname)
-                    DnsPacketCodec.makeDnsError(query, 3)
-                } else {
-                    forwardToUpstream(query.dnsMessage) ?: DnsPacketCodec.makeDnsError(query, 2)
+                    (blocklist.isBlocked(host) ||
+                        DomainMatcher.isBlocked(host, customDomains) ||
+                        SafeSearch.isBypassHost(host))
+                val safeTarget = if (!blocked && host != null) SafeSearch.targetFor(host) else null
+                val replyDns = when {
+                    blocked -> {
+                        ProtectionState.onBlocked(query.hostname)
+                        DnsPacketCodec.makeDnsError(query, 3)
+                    }
+                    safeTarget != null -> answerSafeSearch(query, safeTarget)
+                    else -> forwardToUpstream(query.dnsMessage) ?: DnsPacketCodec.makeDnsError(query, 2)
                 }
                 output.write(DnsPacketCodec.wrapDnsResponse(query, replyDns))
                 output.flush()
@@ -98,6 +106,27 @@ class DnsVpnService : VpnService() {
             try { output.close() } catch (_: Exception) { }
             stopSelf()
         }
+    }
+
+    /** Answers a search-engine lookup with the IPs of its SafeSearch server. */
+    private fun answerSafeSearch(query: DnsQuery, target: String): ByteArray {
+        val m = query.dnsMessage
+        val qtype = ((m[query.questionEnd - 4].toInt() and 0xff) shl 8) or
+            (m[query.questionEnd - 3].toInt() and 0xff)
+        // Only IPv4 (A) is answered. AAAA/HTTPS etc. get an empty reply so the app uses IPv4.
+        if (qtype != 1) return DnsPacketCodec.makeDnsError(query, 0)
+        val ips = resolveTarget(target) ?: return DnsPacketCodec.makeDnsError(query, 2)
+        return SafeSearchDns.makeAResponse(query, ips)
+    }
+
+    private fun resolveTarget(target: String): List<ByteArray>? {
+        val now = System.currentTimeMillis()
+        rewriteCache[target]?.let { if (it.first > now) return it.second }
+        val response = forwardToUpstream(SafeSearchDns.buildAQuery(target)) ?: return null
+        val ips = SafeSearchDns.parseARecords(response)
+        if (ips.isEmpty()) return null
+        rewriteCache[target] = (now + 60_000L) to ips
+        return ips
     }
 
     private fun forwardToUpstream(message: ByteArray): ByteArray? {
