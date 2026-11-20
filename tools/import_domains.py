@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn a permitted/user-supplied domain export into a review queue.
+"""Normalize a permitted/user-supplied domain export into a review queue.
 
 This tool does not crawl websites and never marks a domain as approved.
 Input: one URL or hostname per line, or a CSV with a 'domain'/'url' column.
@@ -10,7 +10,6 @@ import argparse
 import csv
 import ipaddress
 import re
-import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -19,12 +18,26 @@ COMMON_MULTIPART_SUFFIXES = {
     "co.uk", "org.uk", "ac.uk", "com.au", "net.au", "org.au",
     "co.nz", "org.nz", "co.jp", "co.za", "com.br", "com.mx",
 }
+# These are shared publishing/hosting services. Never turn a tenant hostname
+# into a rule for the provider's whole base domain.
+SHARED_HOSTING_BASES = {
+    "tumblr.com", "blogspot.com", "pages.dev", "free.fr", "startspot.nl",
+    "startplezier.nl", "startpagina.nl", "startbewijs.nl", "canalblog.com",
+    "over-blog.com", "centerblog.net", "itch.io", "jouwpagina.nl",
+    "maakjestart.nl", "cjb.net", "skyblog.com", "unblog.fr", "fc2.com",
+    "wordpress.com", "weebly.com", "wixsite.com", "github.io", "webflow.io",
+}
 
 
 def extract_host(raw: str) -> tuple[str | None, str]:
+    """Return a normalized hostname and a validation status."""
     value = raw.strip().strip('"').strip("'")
     if not value or value.startswith("#"):
         return None, "empty_or_comment"
+    if value.startswith("||"):
+        value = value[2:].rstrip("^")
+    elif value.startswith("*."):
+        value = value[2:]
     if any(ch.isspace() for ch in value):
         return None, "whitespace_inside_value"
     candidate = value if "://" in value else "//" + value
@@ -60,9 +73,29 @@ def extract_host(raw: str) -> tuple[str | None, str]:
     return host, "needs_manual_review"
 
 
+def matches_block_rule(hostname: str, rule: str) -> bool:
+    """Match a hostname exactly or as a true DNS subdomain of a rule.
+
+    For example, 'asian.example.com' matches 'example.com', but
+    'notexample.com' and 'example.com.attacker.test' do not.
+    """
+    normalized_host, _ = extract_host(hostname)
+    normalized_rule, _ = extract_host(rule)
+    if not normalized_host or not normalized_rule:
+        return False
+    return normalized_host == normalized_rule or normalized_host.endswith("." + normalized_rule)
+
+
+def is_shared_hosting_domain(hostname: str) -> bool:
+    """Return True for a known shared-hosting base or one of its tenants."""
+    host, _ = extract_host(hostname)
+    if not host:
+        return False
+    return any(host == base or host.endswith("." + base) for base in SHARED_HOSTING_BASES)
+
+
 def read_values(path: Path):
     text = path.read_text(encoding="utf-8-sig")
-    # CSV is recognized by its header; otherwise treat each non-comment line as an entry.
     first = next((line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")), "")
     if "," in first:
         rows = csv.DictReader(text.splitlines())
@@ -82,9 +115,9 @@ def main() -> int:
     args = parser.parse_args()
     if not args.input.is_file():
         parser.error(f"input file not found: {args.input}")
-    seen = set()
-    accepted = []
-    rejected = []
+    seen: set[str] = set()
+    accepted: list[tuple[str, int, str]] = []
+    rejected: list[tuple[int, str, str]] = []
     for line_no, raw in enumerate(read_values(args.input), 1):
         host, status = extract_host(raw)
         if host:
@@ -92,14 +125,16 @@ def main() -> int:
                 rejected.append((line_no, raw, "duplicate"))
             else:
                 seen.add(host)
-                accepted.append((host, line_no, "needs_manual_review"))
-        elif status not in {"empty_or_comment"}:
+                review_status = "shared_hosting_manual_review" if is_shared_hosting_domain(host) else "needs_manual_review"
+                accepted.append((host, line_no, review_status))
+        elif status != "empty_or_comment":
             rejected.append((line_no, raw, status))
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(["hostname", "source_line", "status", "category", "review_notes"])
         for host, line_no, status in accepted:
-            writer.writerow([host, line_no, status, "unclassified", "Verify purpose, ownership, false-positive risk, source rights, and date before blocking."])
+            writer.writerow([host, line_no, status, "unclassified", "Preserve this exact hostname. A block rule matches this hostname and descendants; do not widen it to a shared-hosting provider root."])
     print(f"Review queue: {len(accepted)} unique hostnames -> {args.output}")
     print(f"Rejected/duplicate rows: {len(rejected)}")
     if rejected:
