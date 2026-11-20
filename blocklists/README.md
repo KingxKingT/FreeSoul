@@ -31,3 +31,16 @@ Do not include full URLs, paths, query strings, personal data, or browsing histo
 6. Publish a versioned list with a checksum.
 
 User-submitted candidates are untrusted input and must be reviewed before publication.
+
+
+## Candidate discovery source: ThePornDude
+
+- Directory: https://theporndude.com/
+- The homepage describes itself as a directory/review site for adult websites and advertises a searchable directory of 11,938+ sites. It visibly organizes entries into categories such as free tube sites and tags including AI sites and AI sex chat.
+- Use this only as a **discovery seed**, not as a trusted blocklist or a guarantee of complete coverage.
+- The directory is curated content and may contain redirects, affiliate links, stale entries, mirrors, duplicate brands, or domains that have changed ownership or purpose.
+- Do not blindly block every linked hostname. Extract candidate registrable domains, resolve redirect destinations only where permitted, deduplicate, and review each candidate before publication.
+- Do not scrape at high volume or bypass access controls. Check the site's terms, robots guidance, and permission before automated collection or redistribution. Prefer a permitted export/API or a manually supplied domain list.
+- Keep category provenance (e.g. adult video, adult image, adult chat, AI adult service) and review date. A directory category does not prove every linked domain or subdomain is exclusively adult.
+- Do not treat AI-related directory tags as a complete inventory of AI sexual-content services.
+
