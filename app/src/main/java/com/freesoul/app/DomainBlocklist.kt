@@ -1,4 +1,4 @@
-package com.freesoul
+package com.freesoul.app
 
 import android.content.Context
 import java.io.File
@@ -19,7 +19,10 @@ class DomainBlocklist(context: Context) {
     init {
         val file = File(context.filesDir, "adult_domains.bin")
         // Copy from assets on first run (or when the app is updated).
-        if (!file.exists() || file.length() == 0L) {
+        val updatedAt = try {
+            context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
+        } catch (_: Exception) { 0L }
+        if (!file.exists() || file.length() == 0L || file.lastModified() < updatedAt) {
             context.assets.open("adult_domains.bin").use { input ->
                 file.outputStream().use { input.copyTo(it) }
             }
