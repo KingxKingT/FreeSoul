@@ -19,11 +19,13 @@ class DnsVpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
     private var worker: Thread? = null
     private val active = AtomicBoolean(false)
-    private lateinit var blockedDomains: Set<String>
+    private lateinit var customDomains: Set<String>
+    private lateinit var blocklist: DomainBlocklist
 
     override fun onCreate() {
         super.onCreate()
-        blockedDomains = assets.open("adult_domains.txt").bufferedReader().useLines { lines ->
+        blocklist = DomainBlocklist(applicationContext)
+        customDomains = assets.open("adult_domains.txt").bufferedReader().useLines { lines ->
             lines.mapNotNull { DomainMatcher.normalize(it.substringBefore('#').trim()) }.toSet()
         }
         createNotificationChannel()
@@ -75,7 +77,10 @@ class DnsVpnService : VpnService() {
                 val length = input.read(buffer)
                 if (length <= 0) continue
                 val query = DnsPacketCodec.parseIpv4UdpQuery(buffer, length) ?: continue
-                val replyDns = if (DomainMatcher.isBlocked(query.hostname, blockedDomains)) {
+                val host = DomainMatcher.normalize(query.hostname)
+                val blocked = host != null &&
+                    (blocklist.isBlocked(host) || DomainMatcher.isBlocked(host, customDomains))
+                val replyDns = if (blocked) {
                     ProtectionState.onBlocked(query.hostname)
                     DnsPacketCodec.makeDnsError(query, 3)
                 } else {
