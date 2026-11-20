@@ -1,0 +1,10 @@
+# FreeSoul test blocklist v0.1.0
+# Seven adult-purpose candidate domains reviewed from first-party website material.
+# This is a small test set, not a complete blocklist. Entries match their subdomains.
+cake.ski
+aipornfeed.com
+animatorhub.ai
+coquette.ai
+honeypot.com
+playbun.com
+sweetdream.ai
