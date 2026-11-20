@@ -1,41 +1,30 @@
-# FreeSoul
+# FreeSoul Android test build
 
-FreeSoul is an Android-first adult website protection project. The first milestone is reliable domain-level blocking; social-media image/video moderation is explicitly out of scope until website protection is stable.
+This repository includes an early Android DNS-filtering prototype for sideload testing on Android 10+. It is **not production-ready**.
 
-## Current scope (MVP)
+## What it does
 
-- Android app, initially targeting Android 10+.
-- DNS-based filtering of known adult domains across apps and browsers while protection is active.
-- Curated, updateable domain lists with source attribution and license checks.
-- Allowlist and false-positive reporting workflow.
-- Local protection status and aggregate blocked-request counters.
-- No collection or sale of browsing history.
+- Starts Android `VpnService` after the user approves the VPN permission dialog.
+- Routes DNS lookups through a local VPN DNS address; ordinary web traffic is not tunneled.
+- Checks hostnames against the small test list in `app/src/main/assets/adult_domains.txt`.
+- Blocks a listed hostname and all DNS subdomains using a label-boundary check.
+- Returns NXDOMAIN for blocked names. Other DNS queries are forwarded to Cloudflare DNS, with Google DNS as fallback.
+- Keeps a blocked-request counter locally. FreeSoul does not upload browsing history.
 
-## Important limitations
+## Test list
 
-DNS filtering blocks domains, not individual pages, images, videos, or chat messages. It cannot reliably identify explicit content hosted on a general-purpose platform or distinguish adult content from legitimate content on the same domain. Some apps use encrypted DNS, hard-coded resolvers, or shared hosting and may bypass or resist DNS filtering. FreeSoul must communicate these limits honestly.
+The APK contains seven adult-purpose candidate domains, not a complete blocklist. The large uploaded hostname inventory remains review-only and is not bundled into the APK.
 
-## Technical direction
+## Limitations
 
-Evaluate an Apache-2.0-compatible Android codebase such as [RethinkDNS](https://github.com/celzero/rethink-app) as a possible foundation or reference. Do not assume it is a drop-in library: inspect its modules, integration boundaries, current license notices, and build process before deciding whether to fork or reuse components.
+- IPv4 UDP DNS only. DNS-over-TCP, IPv6-specific paths, browser DNS-over-HTTPS, and strict Android Private DNS may bypass this prototype.
+- DNS filtering blocks hostnames, not individual pages, images, chat messages, or videos.
+- Only one Android VPN can normally be active at a time.
+- Allowed DNS lookups are sent in plaintext UDP to Cloudflare or Google DNS.
+- The small test list is not complete protection.
 
-Use Android's supported `VpnService` approach for local DNS filtering if the chosen architecture requires it. No root access, HTTPS interception, certificate installation, or accessibility-based screen scraping in the MVP.
+For the initial test, temporarily disable browser Secure DNS / DNS-over-HTTPS and set Android Private DNS to Off or Automatic, not a strict provider hostname. This reduces DNS privacy during the test.
 
-## Repository map
+## Build
 
-- `docs/PRODUCT_SCOPE.md` — MVP requirements and non-goals.
-- `docs/TECHNICAL_PLAN.md` — proposed architecture and validation plan.
-- `blocklists/README.md` — list sources, format, update and licensing rules.
-- `app/` — Android application (to be added after the foundation is selected).
-
-## Development status
-
-Planning and repository setup. No APK has been built or tested yet.
-
-## Contributing domain lists
-
-Send candidate domains as plain text or CSV. Every entry will be normalized, deduplicated, checked for malformed values and reviewed for false positives before inclusion. Do not submit URLs containing personal information or private browsing records.
-
-## License
-
-The license for FreeSoul's original code and documentation has not yet been selected. Third-party code and blocklists retain their own licenses and notices; do not assume that every upstream list can be redistributed commercially.
+GitHub Actions builds `app-debug.apk` and uploads it as the `FreeSoul-debug-apk` workflow artifact. Local builds require JDK 17, Android SDK Platform 35, Build Tools 35.0.0, and Gradle 8.9.
