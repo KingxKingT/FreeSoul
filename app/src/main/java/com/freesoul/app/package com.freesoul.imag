@@ -1,0 +1,221 @@
+package com.freesoul.image   // <-- change to your package name
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.util.LruCache
+import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import org.tensorflow.lite.Interpreter
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.FileInputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.channels.FileChannel
+
+/*
+ * ============================ SETUP ============================
+ * 1. app/build.gradle.kts
+ *      dependencies { implementation("org.tensorflow:tensorflow-lite:2.14.0") }   // pin a version you have verified
+ *      android { androidResources { noCompress += "tflite" } }                     // model must stay uncompressed
+ * 2. Put an NSFW image model at app/src/main/assets/nsfw.tflite
+ *      Default settings below match GantMan's nsfw_model (MIT, MobileNet v2): input 224x224 RGB scaled to 0..1,
+ *      5 outputs in the order [drawings, hentai, neutral, porn, sexy].
+ *      If you use another model, change INPUT_SIZE / CLASS_* / the preprocessing in score(). Check the model's license.
+ * 3. Use it:
+ *      val guard = ImageGuard(NsfwClassifier(context))
+ *      webView.settings.javaScriptEnabled = true
+ *      webView.webViewClient = GuardedWebViewClient(guard)
+ * ================================================================
+ */
+
+class NsfwClassifier(
+    context: Context,
+    modelAsset: String = "nsfw.tflite",
+    private val inputSize: Int = 224,
+    // output indices (GantMan order)
+    private val classHentai: Int = 1,
+    private val classPorn: Int = 3,
+    private val classSexy: Int = 4,
+    private val numClasses: Int = 5,
+    private val sexyWeight: Float = 0.5f,   // "sexy" is borderline (swimwear etc.): count it at half weight
+) {
+    private val interpreter: Interpreter
+
+    init {
+        val fd = context.assets.openFd(modelAsset)
+        val model = FileInputStream(fd.fileDescriptor).channel
+            .map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
+        interpreter = Interpreter(model, Interpreter.Options().setNumThreads(2))
+    }
+
+    /** 0.0 (safe) .. 1.0 (explicit). The Interpreter is not thread-safe, so calls are serialized. */
+    @Synchronized
+    fun score(bitmap: Bitmap): Float {
+        val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+        val pixels = IntArray(inputSize * inputSize)
+        scaled.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
+        if (scaled !== bitmap) scaled.recycle()
+
+        val input = ByteBuffer.allocateDirect(4 * inputSize * inputSize * 3).order(ByteOrder.nativeOrder())
+        for (p in pixels) {
+            input.putFloat(((p shr 16) and 0xFF) / 255f)
+            input.putFloat(((p shr 8) and 0xFF) / 255f)
+            input.putFloat((p and 0xFF) / 255f)
+        }
+        input.rewind()
+
+        val out = Array(1) { FloatArray(numClasses) }
+        interpreter.run(input, out)
+        val o = out[0]
+        return (o[classPorn] + o[classHentai] + sexyWeight * o[classSexy]).coerceIn(0f, 1f)
+    }
+}
+
+class ImageGuard(
+    private val classifier: NsfwClassifier,
+    private val threshold: Float = 0.6f,     // lower = stricter (more false positives)
+    private val minSidePx: Int = 48,         // icons/sprites smaller than this are allowed without scanning
+    private val maxBytes: Int = 8 * 1024 * 1024,
+    private val failClosed: Boolean = true,  // if an image can't be decoded/classified: block it (safer for all ages)
+) {
+    private val blockedVerdicts = LruCache<String, Boolean>(3000)   // url -> true if blocked
+
+    private val placeholder: ByteArray by lazy {
+        val bmp = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+        bmp.eraseColor(0xFFDDDDDD.toInt())
+        val bos = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.PNG, 100, bos)
+        bmp.recycle()
+        bos.toByteArray()
+    }
+
+    /** Returns a response for image requests (original bytes or a gray placeholder), null for everything else. */
+    fun inspect(request: WebResourceRequest): WebResourceResponse? {
+        if (!request.method.equals("GET", true)) return null
+        val url = request.url.toString()
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return null
+        if (!looksLikeImage(request)) return null
+
+        blockedVerdicts.get(url)?.let { if (it) return blockedResponse() }
+
+        return try {
+            fetchAndCheck(url, request)
+        } catch (e: Exception) {
+            if (failClosed) blockedResponse() else null
+        }
+    }
+
+    private fun looksLikeImage(r: WebResourceRequest): Boolean {
+        val accept = r.requestHeaders.entries.firstOrNull { it.key.equals("Accept", true) }?.value.orEmpty()
+        if (accept.contains("image/")) return true
+        val path = r.url.path?.lowercase().orEmpty()
+        return IMAGE_EXT.any { path.endsWith(it) }
+    }
+
+    private fun fetchAndCheck(url: String, request: WebResourceRequest): WebResourceResponse? {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 8000
+            readTimeout = 12000
+            instanceFollowRedirects = true
+            request.requestHeaders.forEach { (k, v) ->
+                // let HttpURLConnection manage compression; Range would give partial images
+                if (!k.equals("Accept-Encoding", true) && !k.equals("Range", true)) setRequestProperty(k, v)
+            }
+            CookieManager.getInstance().getCookie(url)?.let { setRequestProperty("Cookie", it) }
+        }
+
+        try {
+            val code = conn.responseCode
+            if (code !in 200..299) return null          // errors/redirect leftovers: let WebView handle them
+
+            val mime = (conn.contentType ?: "image/*").substringBefore(';').trim().lowercase()
+            if (mime == "image/svg+xml") return null     // vector images: not classifiable
+
+            val bytes = conn.inputStream.use { readLimited(it, maxBytes) }
+                ?: return blockedAndCache(url)           // too large -> block
+
+            // decode bounds first (cheap)
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                return if (failClosed) blockedAndCache(url) else passThrough(bytes, mime, conn)
+            }
+            if (minOf(bounds.outWidth, bounds.outHeight) < minSidePx) return passThrough(bytes, mime, conn)
+
+            // downsample large images before classification
+            var sample = 1
+            while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= 512) sample *= 2
+            val bmp = BitmapFactory.decodeByteArray(
+                bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample }
+            ) ?: return if (failClosed) blockedAndCache(url) else passThrough(bytes, mime, conn)
+
+            val unsafe = try { classifier.score(bmp) } finally { bmp.recycle() }
+
+            return if (unsafe >= threshold) blockedAndCache(url) else passThrough(bytes, mime, conn)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun readLimited(input: java.io.InputStream, limit: Int): ByteArray? {
+        val bos = ByteArrayOutputStream()
+        val buf = ByteArray(16 * 1024)
+        var total = 0
+        while (true) {
+            val n = input.read(buf)
+            if (n < 0) break
+            total += n
+            if (total > limit) return null
+            bos.write(buf, 0, n)
+        }
+        return bos.toByteArray()
+    }
+
+    private fun passThrough(bytes: ByteArray, mime: String, conn: HttpURLConnection): WebResourceResponse {
+        val headers = HashMap<String, String>()
+        conn.headerFields.forEach { (k, v) ->
+            if (k == null || v.isNullOrEmpty()) return@forEach
+            if (k.equals("Content-Encoding", true) || k.equals("Content-Length", true) ||
+                k.equals("Transfer-Encoding", true)) return@forEach
+            headers[k] = v.first()      // keeps CORS headers (Access-Control-Allow-Origin) intact
+        }
+        return WebResourceResponse(mime, null, conn.responseCode, "OK", headers, ByteArrayInputStream(bytes))
+    }
+
+    private fun blockedAndCache(url: String): WebResourceResponse {
+        blockedVerdicts.put(url, true)
+        return blockedResponse()
+    }
+
+    private fun blockedResponse() = WebResourceResponse(
+        "image/png", null, 200, "OK",
+        mapOf("Cache-Control" to "no-store", "Access-Control-Allow-Origin" to "*"),
+        ByteArrayInputStream(placeholder)
+    )
+
+    companion object {
+        private val IMAGE_EXT = listOf(".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif", ".heic")
+    }
+}
+
+class GuardedWebViewClient(private val guard: ImageGuard) : WebViewClient() {
+    // Runs on a WebView background thread, so blocking network + inference here is fine.
+    override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
+        guard.inspect(request)
+}
+
+/*
+ * KNOWN GAPS (be honest about these in your docs):
+ *  - Only filters inside this WebView browser; other browsers/apps are unaffected.
+ *  - Video, canvas-drawn images, data: and blob: URLs are not scanned.
+ *  - Animated GIF/WebP: only the first frame is classified.
+ *  - Models make mistakes in both directions. Tune `threshold` and `sexyWeight` with real test images.
+ *  - Scanning adds latency per image; first load of image-heavy pages is slower (cached verdicts help on revisits).
+ */
